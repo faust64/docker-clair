@@ -1,0 +1,389 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: clair-persistent
+  template: clair-persistent-template
+message: A Clair service has been created in your project.  Start scanning images
+  using clair-scanner <img> config.yaml https://<route-fqdn> <local-address>
+metadata:
+  annotations:
+    description: Clair Persistent
+    iconClass: icon-openshift
+    openshift.io/display-name: Clair (Persistent)
+    openshift.io/documentation-url: https://github.com/coreos/clair/blob/master/Documentation/running-clair.md
+    openshift.io/long-description: This template deploys a Clair server
+    tags: instant-app,clair
+  name: clair-persistent
+objects:
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    annotations:
+      template.openshift.io/expose-admpassword: "{.data['database-admin-password']}"
+      template.openshift.io/expose-database_name: "{.data['database-name']}"
+      template.openshift.io/expose-password: "{.data['database-password']}"
+      template.openshift.io/expose-username: "{.data['database-user']}"
+    name: clair-postgres
+  stringData:
+    database-admin-password: "${POSTGRES_ADMIN_PASSWORD}"
+    database-name: "${POSTGRES_DB}"
+    database-password: "${POSTGRES_PASSWORD}"
+    database-user: "${POSTGRES_USER}"
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: clair
+  stringData:
+    config.yaml: |-
+      clair:
+        database:
+          type: pgsql
+          options:
+            source: "host=clair-postgres port=5432 user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=${POSTGRES_DB} sslmode=${POSTGRES_SSL_MODE} statement_timeout=60000"
+            cachesize: 16384
+            paginationkey: "${PAGINATION_KEY}"
+        api:
+          # v3 grpc/RESTful API server address.
+          addr: "0.0.0.0:6060"
+          healthaddr: "0.0.0.0:6061"
+          timeout: 900s
+          servername:
+          cafile:
+          keyfile:
+          certfile:
+        worker:
+          namespace_detectors:
+          - os-release
+          - lsb-release
+          - apt-sources
+          - alpine-release
+          - redhat-release
+          feature_listers:
+          - apk
+          - dpkg
+          - rpm
+        updater:
+          interval: "2h"
+          enabledupdaters:
+          - debian
+          - ubuntu
+          - rhel
+          - oracle
+          - alpine
+        notifier:
+          attempts: 3
+          renotifyinterval: 2h
+          http:
+            endpoint: "${CLAIR_POST_ADDRESS}"
+            servername:
+            cafile:
+            keyfile:
+            certfile:
+            proxy:
+  type: Opaque
+- apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: clair-postgres
+  spec:
+    accessModes: [ ReadWriteOnce ]
+    resources:
+      requests:
+        storage: ${CLAIR_POSTGRES_VOLUME_CAPACITY}
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    name: clair-postgres
+  spec:
+    replicas: 1
+    selector:
+      name: clair-postgres
+    strategy:
+      type: Recreate
+    template:
+      metadata:
+        labels:
+          name: clair-postgres
+      spec:
+        dnsPolicy: ClusterFirst
+        containers:
+        - env:
+          - name: POSTGRESQL_ADMIN_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: clair-postgres
+                key: database-admin-password
+          - name: POSTGRESQL_DATABASE
+            valueFrom:
+              secretKeyRef:
+                name: clair-postgres
+                key: database-name
+          - name: POSTGRESQL_MAX_CONNECTIONS
+            value: ${CLAIR_POSTGRES_MAX_CONNECTIONS}
+          - name: POSTGRESQL_SHARED_BUFFERS
+            value: ${CLAIR_POSTGRES_SHARED_BUFFERS}
+          - name: POSTGRESQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: clair-postgres
+                key: database-password
+          - name: POSTGRESQL_USER
+            valueFrom:
+              secretKeyRef:
+                name: clair-postgres
+                key: database-user
+          image: ' '
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - '-i'
+              - '-c'
+              - pg_isready -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+          name: postgres
+          ports:
+          - containerPort: 5432
+            protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - '-i'
+              - '-c'
+              - psql -h 127.0.0.1 -U $POSTGRESQL_USER -q -d $POSTGRESQL_DATABASE -c 'SELECT 1'
+            initialDelaySeconds: 5
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: "${CLAIR_POSTGRES_CPU_LIMIT}"
+              memory: "${CLAIR_POSTGRES_MEMORY_LIMIT}"
+          terminationMessagePath: /dev/termination-log
+          volumeMounts:
+          - name: data
+            mountPath: /var/lib/pgsql/data
+        restartPolicy: Always
+        volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: clair-postgres
+    triggers:
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+        - postgres
+        from:
+          kind: ImageStreamTag
+          name: ${POSTGRES_IMAGESTREAM_TAG}
+          namespace: ${POSTGRES_NAMESPACE}
+    - type: ConfigChange
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      template.openshift.io/expose-uri: postgres://{.spec.clusterIP}:{.spec.ports[?(.name=="postgresql")].port}
+    name: clair-postgres
+  spec:
+    ports:
+    - name: postgresql
+      protocol: TCP
+      port: 5432
+      targetPort: 5432
+    selector:
+      name: clair-postgres
+    type: ClusterIP
+- apiVersion: v1
+  kind: ImageStream
+  metadata:
+    name: clair
+  spec:
+    tags:
+    - from:
+        kind: DockerImage
+        name: quay.io/coreos/clair
+      importPolicy:
+        scheduled: true
+      name: latest
+      referencePolicy:
+        type: Local
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    name: clair
+  spec:
+    replicas: 1
+    selector:
+      name: clair
+    strategy:
+      type: Rolling
+    template:
+      metadata:
+        labels:
+          name: clair
+      spec:
+        containers:
+        - args:
+          - "-log-level=info"
+          - "--insecure-tls"
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 6061
+          name: clair
+          ports:
+          - name: clair-api
+            containerPort: 6060
+            protocol: TCP
+          - name: clair-health
+            containerPort: 6061
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 6061
+          resources:
+            limits:
+              cpu: "${CLAIR_CPU_LIMIT}"
+              memory: "${CLAIR_MEMORY_LIMIT}"
+            requests:
+              cpu: "${CLAIR_CPU_REQUEST}"
+              memory: "${CLAIR_MEMORY_REQUEST}"
+          volumeMounts:
+          - name: config
+            mountPath: /etc/clair
+            readOnly: true
+        volumes:
+        - name: config
+          secret:
+            secretName: clair
+    triggers:
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+        - clair
+        from:
+          kind: ImageStreamTag
+          name: clair:latest
+    - type: ConfigChange
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: clair
+  spec:
+    type: ClusterIP
+    ports:
+    - name: clair-api
+      port: 6060
+      targetPort: 6060
+      protocol: TCP
+    - name: clair-health
+      port: 6061
+      targetPort: 6061
+      protocol: TCP
+    selector:
+      name: clair
+- apiVersion: v1
+  kind: Route
+  metadata:
+    annotations:
+      haproxy.router.openshift.io/timeout: 3m
+    name: clair
+  spec:
+    port:
+      targetPort: 6060
+    tls:
+      insecureEdgeTerminationPolicy: Redirect
+      termination: edge
+    to:
+      kind: Service
+      name: clair
+parameters:
+- name: CLAIR_CPU_LIMIT
+  description: Maximum amount of CPU a Clair app container can use
+  displayName: Clair CPU Limit
+  required: true
+  value: 200m
+- name: CLAIR_CPU_REQUEST
+  description: Requested amount of CPU by Clair app container
+  displayName: Clair CPU Request
+  required: true
+  value: 100m
+- name: CLAIR_MEMORY_LIMIT
+  description: Maximum amount of memory a Clair app container can use
+  displayName: Clair Memory Limit
+  required: true
+  value: 1500Mi
+- name: CLAIR_MEMORY_REQUEST
+  description: Requested amount of memory by Clair app container
+  displayName: Clair Memory Request
+  required: true
+  value: 512Mi
+- name: CLAIR_POST_ADDRESS
+# value: "https://example.com/notify/me"
+- name: CLAIR_POSTGRES_CPU_LIMIT
+  description: Maximum amount of CPU a Clair database container can use
+  displayName: Clair Postgres CPU Limit
+  required: true
+  value: 500m
+- name: CLAIR_POSTGRES_MAX_CONNECTIONS
+  description: Maximum amount of connections PostgreSQL should accept
+  displayName: Maximum Postgres Connections
+  required: true
+  value: "100"
+- name: CLAIR_POSTGRES_MEMORY_LIMIT
+  description: Maximum amount of memory a Clair database container can use
+  displayName: Clair Postgres Memory Limit
+  required: true
+  value: 768Mi
+- name: CLAIR_POSTGRES_SHARED_BUFFERS
+  displayName: Postgres Shared Buffer Amount
+  description: Amount of Memory PostgreSQL should dedicate to Shared Buffers
+  required: true
+  value: 12MB
+- name: CLAIR_POSTGRES_VOLUME_CAPACITY
+  description: Volume space available for Clair Postgres database, e.g. 512Mi, 2Gi.
+  displayName: Clair Postgres Volume Capacity
+  required: true
+  value: 2Gi
+- name: POSTGRES_ADMIN_PASSWORD
+  description: Clair PostgreSQL Admin service account password
+  displayName: Clair PostgreSQL Admin Password
+  from: '[a-zA-Z0-9]{40}'
+  generate: expression
+  required: true
+- name: POSTGRES_DB
+  description: Clair PostgreSQL database name
+  displayName: Clair PostgreSQL Database
+  required: true
+  value: clair
+- name: POSTGRES_IMAGESTREAM_TAG
+  description: PostgreSQL ImageStream Tag
+  displayName: postgresql imagestream tag
+  required: true
+  value: postgresql:10
+- name: POSTGRES_NAMESPACE
+  description: The OpenShift Namespace where the Postgres ImageStream resides
+  displayName: Postgres Namespace
+  required: true
+  value: openshift
+- name: POSTGRES_PASSWORD
+  description: Clair PostgreSQL service account password
+  displayName: Clair PostgreSQL Password
+  from: '[a-zA-Z0-9]{40}'
+  generate: expression
+  required: true
+- name: POSTGRES_SSL_MODE
+  value: disable
+- name: POSTGRES_USER
+  description: Clair PostgreSQL service account username
+  displayName: Clair PostgreSQL Username
+  required: true
+  value: clair
+- name: PAGINATION_KEY
+  required: true
+  value: XxoPtCUzrUv4JV5dS+yQ+MdW7yLEJnRMwigVY/bpgtQ=

@@ -1,0 +1,3 @@
+# Clair
+
+OpenShift-friendly
